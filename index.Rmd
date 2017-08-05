@@ -1,0 +1,297 @@
+---
+title: "Coursera ML Project"
+author: "A-C TREGOUET"
+date: "5/8/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Weight Lifting Exercise
+
+The goal is to predict how well a weight lifting exercise is done, using sensor's data.
+
+## Setting R project
+- install packages : munsell, caret, randomForest, gbm, survival, splines, plyr, doMC, doParallel
+- download libraries : ggplot2, caret, gbm, survival, splines, plyr, doMC, randomForest, parallel, doParallel
+- configure parallel processing (see [this post](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md) ) 
+```{r, echo=FALSE, include=FALSE}
+# packages
+repo <- 'http://cran.us.r-project.org';
+install.packages('munsell', repos=repo)
+install.packages('caret', repos=repo)
+install.packages('randomForest', repos=repo)
+install.packages('gbm', repos=repo)
+install.packages('survival', repos=repo)
+install.packages('splines', repos=repo)
+install.packages('plyr', repos=repo)
+install.packages('doMC', repos=repo)
+install.packages('doParallel', repos=repo)
+
+# libraries
+library(ggplot2)
+library(caret)
+library(gbm)
+library(survival)
+library(splines)
+library(plyr)
+library(doMC)
+library(randomForest)
+library(parallel)
+library(doParallel)
+
+# parallel processing
+set.seed(7993)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "cv", number = 10, allowParallel = TRUE)
+```
+
+## Retrieveing source files and creating datasets
+
+There are 2 datasets : *pml-training.csv* and *pml-testing.csv*
+
+*pml-testing.csv* contains observations without the outcome, because the goal here is to predict it. So, I will not use this data set to build the model : it's the guessing set.
+
+To evaluate the model, cross validation is needed, so I will split the *pml-training.csv* into a training set and a testing set. The model will be built using training set, and validated/evaluated using testing set. At the end, the model will be used on guessing set to predict 20 observations.
+
+```{r}
+sourceFile <- read.csv("~/Desktop/pml-training.csv")
+inTrain <- createDataPartition(y=sourceFile$classe, p=0.7, list=FALSE)
+training <- sourceFile[inTrain,]
+testing <- sourceFile[-inTrain,]
+guessing <- read.csv("~/Desktop/pml-testing.csv")
+```
+
+## Cleaning dataset
+
+### There's too much variables
+
+Let's see how much variables contains data sets : 
+```{r, echo=TRUE, include=TRUE}
+dim(training)
+```
+There are 160 variables, which is huge! First, my goal is to reduce the number of predictors.
+
+### Excluding variables with lot of missing values
+
+Looking brievly at data using...
+```
+summary(training)
+head(training)
+```
+...it seems there are a lot of NA, blank and "#DIV/0!" values. I all replace them by NA in the training set, and look how many variables have more than 90% of missing values :
+```{r, echo=TRUE, include=TRUE}
+training[training==""] <- NA
+training[training=="#DIV/0!"] <- NA
+dim(training[colMeans(is.na(training))>0.9])
+```
+100 variables contains 90% missing values! They are not relevant enough, so I exclude them from the training set : 
+```{r, echo=TRUE, include=TRUE}
+columsToKeep <- colnames(training[colMeans(is.na(training))<0.9])
+training <- training[,columsToKeep]
+dim(training)
+```
+Now the training set contains 60 variables.
+
+### Excluding data out of context
+
+The goal is to predict the outcome with sensor's parameters. So, I thinkk I can exclude all variables that are relative to test executions (like id, datetime, window, username) :
+```{r, echo=TRUE, include=TRUE}
+training <- training[,-c(1:7)]
+dim(training)
+```
+Now the training set contains 53 variables.
+
+### Variables correlation
+
+Does the training set contain lot ofcorrelated variables ?
+```{r, echo=TRUE, include=TRUE}
+corr <- 1:100
+diplayCor <- 1:100
+M <- abs(cor(training[,-c(1, dim(training))]))
+for (indexCor in 1:100){
+  diplayCor[indexCor] <- length(unique(rownames(which(M > indexCor/100 & M < 1,arr.ind = T))))
+}
+plot(diplayCor, xlab="% of correlation", ylab = "number of variables which are correlated")
+```
+
+On the chart, I can guess that about 30 variables are highly (more than 70%) correlated. I can suppose that variables of training set could be summarized into several variables only. I will give a try to preprocess data using PCA.
+
+
+## Preprocessing data (with PCA)
+
+I apply PCA in order to keep 90% of data information : 
+```{r, echo=TRUE}
+preProcPCA <- preProcess(training[,-dim(training)],method = "pca", tresh=0.9)
+predPCA <- predict(preProcPCA,training[,-dim(training)])
+```
+
+Instead of having 53 variables, PCA results indicated that training set could be sumarized by 25 variables.
+
+## Applying operations on testing set 
+
+On the testing set, I exclude the same variables I exluded in the training set :
+```{r, echo=TRUE}
+testing <- testing[,columsToKeep]
+testing <- testing[,-c(1:7)]
+dim(testing)
+```
+I check that test set now have 53 variables too.
+
+And now I apply PCA from training set to testing set :
+```{r, echo=TRUE}
+testPCA <- predict(preProcPCA,testing[,-dim(testing)])
+```
+
+
+## Building models
+
+Random forests and boostings often are the top performance algorithms for classification predictions. I will apply them with and without preprocessing with PCA.
+
+Computation duration of each model building is quite long. I decided to save it and to include it in model comparisons. Computation durations are calculated this way :
+```
+start.time <- Sys.time()
+{ ... building the model ... }
+end.time <- Sys.time()
+timeModel <- difftime(end.time, start.time, units="mins")
+```
+
+I will first build every model separately and then compare them.
+
+### Random forest
+ 
+#### Random forest without preprocessing with PCA
+
+I create the model : 
+```{r, echo=TRUE}
+start.time <- Sys.time()
+modelFitRF <- randomForest(classe ~ ., data=training, importance=TRUE, proximity=TRUE)
+end.time <- Sys.time()
+timeRF <- difftime(end.time, start.time, units="mins")
+modelFitRF
+```
+*Note : using caret 'train' function was too long, that's why I choose 'randomForest'.*
+
+I apply the built model to the testing set, and compare predictions to reality :
+```{r, echo=TRUE}
+finalPredictionRF <- predict(modelFitRF,testing)
+confRF <- confusionMatrix(testing$classe,finalPredictionRF)
+confRF
+accRF <- confRF$overall['Accuracy'] 
+```
+
+#### Random forest with preprocessing with PCA
+
+I create the model : 
+```{r, echo=TRUE}
+start.time <- Sys.time()
+modelFitPCARF <- train(y=training$classe,method="rf",x=predPCA, trControl = fitControl)
+end.time <- Sys.time()
+timePCARF <- difftime(end.time, start.time, units="mins")
+modelFitPCARF$finalModel
+```
+
+I apply the built model to the testing set, and compare predictions to reality : 
+```{r, echo=TRUE}
+finalPredictionPCARF <- predict(modelFitPCARF,testPCA)
+confPCARF <- confusionMatrix(testing$classe,finalPredictionPCARF)
+confPCARF
+accPCARF <- confPCARF$overall['Accuracy'] 
+```
+
+### Boosting
+
+
+#### Boosting without preprocessing with PCA
+
+I create the model : 
+```{r, echo=TRUE}
+start.time <- Sys.time()
+modelFitGBM <- train(y=training$classe,method="gbm",x=training)
+end.time <- Sys.time()
+timeGBM <- difftime(end.time, start.time, units="mins")
+modelFitGBM
+```
+
+I apply the built model to the testing set, and compare predictions to reality : 
+```{r, echo=TRUE}
+finalPredictionGBM <- predict(modelFitGBM,testing)
+confGBM <- confusionMatrix(testing$classe,finalPredictionGBM)
+confGBM
+accGBM <- confGBM$overall['Accuracy'] 
+```
+
+
+#### Boosting with preprocessing with PCA
+
+I create the model : 
+```{r, echo=TRUE}
+start.time <- Sys.time()
+modelFitPCAGBM <- train(y=training$classe,method="gbm",x=predPCA)
+end.time <- Sys.time()
+timePCAGBM <- difftime(end.time, start.time, units="mins")
+modelFitPCAGBM
+```
+
+I apply it to the testing set, and compare predictions to reality : 
+```{r, echo=TRUE}
+finalPredictionPCAGBM <- predict(modelFitPCAGBM,testPCA)
+confPCAGBM <- confusionMatrix(testing$classe,finalPredictionPCAGBM)
+confPCAGBM
+accPCAGBM <- confPCAGBM$overall['Accuracy'] 
+```
+
+## Comparing models
+
+So now each model have been built, here is a summary of their accuracy and computation duration :
+
+ Preprocessing PCA | Random Forest | Boosting
+------------- | ------------- | -------------
+No  | accuracy : `r accRF` | accuracy : `r accGBM`
+No  | computing duration : `r timeRF` min | computing duration : `r timeGBM` min 
+Yes  | accuracy : `r accPCARF` | accuracy : `r accPCAGBM`
+Yes  | computing duration : `r timePCARF` min | computing duration : `r timePCAGBM` min 
+
+We can plot this information : 
+```{r, echo=TRUE}
+timeComputations <- c(timeRF,timePCARF,timeGBM,timePCAGBM)
+accuracies <- c(accRF,accPCARF,accGBM,accPCAGBM)
+models <- c("Random Forest", "PCA + Random Forest", "Boosting", "PCA + Boosting")
+colors <- c('red', 'blue', 'green',' brown')
+comparisons <- data.frame(timeComputations, accuracies, models,colors)
+qplot(timeComputations,accuracies,colour=models,data=comparisons)
+```
+
+Balancing models accuracy VS their computation duration, the best models seem to be Random Forest and Boosting.
+
+Nevertheless, the 100% accuracy of Boosting model is weird. I fear overfitting of boosting model, so I will finally consider Random Forest model. But I'd be curious to see confrontation of predictions between these two models on the guessing set.
+
+# Predictions
+
+## Applying operations on guessing set 
+
+On the guessing set, I exclude the same variables I exluded in the training set :
+```{r, echo=TRUE}
+columsToKeep[columsToKeep=="classe"] <- "problem_id"
+guessing <- guessing[,columsToKeep]
+guessing <- guessing[,-c(1:7)]
+guessing <- guessing[,-c(53)]
+dim(guessing)
+```
+I check that guessing set now have 52 variables (53 without 'classe' variable)
+
+
+```{r, echo=TRUE}
+finalPrediction <- predict(modelFitRF,guessing)
+finalPredictionGBMTest <- predict(modelFitGBM,guessing)
+confusionMatrix(finalPrediction,finalPredictionGBMTest)
+```
+I can notice that predictions using Random Forest and Boosting are really not the same, confirming my hypothesis of a not reliable Boosting model (maybe overfitting).
+
+So I use Random Forest model to predict the 20 observations. Here is the final result :
+```{r, echo=TRUE}
+head(finalPrediction, length(finalPrediction))
+```
